@@ -361,7 +361,16 @@ extension SMB2Client {
         }
     }
 
-    private func wait_for_reply(_ cb: inout CBData) throws {
+    private func wait_for_reply(_ cb: CBData) throws {
+        // A timeout leaves libsmb2 holding the callback pointer. Tear down the
+        // failed connection while that storage is still alive, before another
+        // operation can service a delayed reply into an expired stack frame.
+        defer {
+            if !cb.isFinished, let failedContext = context {
+                context = nil
+                smb2_destroy_context(failedContext)
+            }
+        }
         let startDate = Date()
         while !cb.isFinished {
             var pfd = pollfd()
@@ -424,11 +433,11 @@ extension SMB2Client {
                     dataHandlerError = error
                 }
             }
-            let result = try withUnsafeMutablePointer(to: &cb) { cb in
-                try handler(context, cb)
+            try withUnsafeMutablePointer(to: &cb) { cb in
+                let result = try handler(context, cb)
+                try POSIXError.throwIfError(result, description: error)
+                try wait_for_reply(cb.pointee)
             }
-            try POSIXError.throwIfError(result, description: error)
-            try wait_for_reply(&cb)
             let cbResult = cb.result
 
             try POSIXError.throwIfError(cbResult, description: error)
@@ -462,11 +471,11 @@ extension SMB2Client {
                     dataHandlerError = error
                 }
             }
-            let pdu = try withUnsafeMutablePointer(to: &cb) { cb in
-                try handler(context, cb).unwrap()
+            try withUnsafeMutablePointer(to: &cb) { cb in
+                let pdu = try handler(context, cb).unwrap()
+                smb2_queue_pdu(context, pdu)
+                try wait_for_reply(cb.pointee)
             }
-            smb2_queue_pdu(context, pdu)
-            try wait_for_reply(&cb)
 
             try POSIXError.throwIfErrorStatus(cb.status)
             if let error = dataHandlerError { throw error }
